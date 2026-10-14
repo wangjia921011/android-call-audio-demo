@@ -3,6 +3,7 @@ package com.android.example.myapplication;
 import android.telecom.Call;
 import android.telecom.CallAudioState;
 import android.telecom.InCallService;
+import android.os.Build;
 import android.util.Log;
 
 import java.util.IdentityHashMap;
@@ -62,6 +63,14 @@ public final class CallStateInCallService extends InCallService {
         callbacks.put(call, callback);
         call.registerCallback(callback);
         publishAggregateCallState();
+    }
+
+    @Override
+    public void onCallAudioStateChanged(CallAudioState audioState) {
+        super.onCallAudioStateChanged(audioState);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            CallCaptureService.onTelecomAudioRouteChanged();
+        }
     }
 
     @Override

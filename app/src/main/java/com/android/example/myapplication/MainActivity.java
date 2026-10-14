@@ -49,7 +49,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int RECORD_AUDIO_REQUEST_CODE = 1001;
     private static final int NOTIFICATION_REQUEST_CODE = 1002;
 
-    private static final int SAMPLE_RATE_HZ = 48_000;
+    private static final int SAMPLE_RATE_HZ = PcmFormat.TARGET_SAMPLE_RATE_HZ;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
     private static final int BYTES_PER_SAMPLE = 2;
     private static final int READ_CHUNK_BYTES = SAMPLE_RATE_HZ * BYTES_PER_SAMPLE / 20;
@@ -449,8 +449,13 @@ public class MainActivity extends AppCompatActivity {
             lastDownlinkOutputFile = inputFile;
         }
 
+        if (!PcmFileStore.isUsablePcm(this, inputFile)) {
+            playbackStatusText.setText(R.string.invalid_pcm_selection);
+            return;
+        }
+        PcmFormat format = PcmFormat.fromFile(inputFile);
         int minBufferSize = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE_HZ, AudioFormat.CHANNEL_OUT_MONO, ENCODING);
+                format.sampleRate, AudioFormat.CHANNEL_OUT_MONO, ENCODING);
         if (minBufferSize <= 0) {
             playbackStatusText.setText(getString(
                     R.string.status_playback_buffer_failed, minBufferSize));
@@ -466,7 +471,7 @@ public class MainActivity extends AppCompatActivity {
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build())
                     .setAudioFormat(new AudioFormat.Builder()
-                            .setSampleRate(SAMPLE_RATE_HZ)
+                            .setSampleRate(format.sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .setEncoding(ENCODING)
                             .build())
@@ -511,7 +516,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         playbackRunning.set(true);
-        double seconds = inputFile.length() / (double) (SAMPLE_RATE_HZ * BYTES_PER_SAMPLE);
+        double seconds = format.seconds(inputFile.length());
         updateOutputPaths();
         playbackStatusText.setText(getString(
                 R.string.status_playing, directionName, inputFile.getName(), seconds));
@@ -533,7 +538,7 @@ public class MainActivity extends AppCompatActivity {
         try (BufferedInputStream input = new BufferedInputStream(
                 new FileInputStream(inputFile), READ_CHUNK_BYTES * 4)) {
             while (playbackRunning.get()) {
-                int bytesRead = input.read(buffer);
+                int bytesRead = PcmIo.readFrames(input, buffer, BYTES_PER_SAMPLE);
                 if (bytesRead < 0) {
                     reachedEnd = true;
                     break;
@@ -546,7 +551,7 @@ public class MainActivity extends AppCompatActivity {
                             offset,
                             bytesRead - offset,
                             AudioTrack.WRITE_BLOCKING);
-                    if (bytesWritten < 0) {
+                    if (bytesWritten <= 0) {
                         if (playbackRunning.get()) {
                             terminalMessage = "AudioTrack.write() 失败：" + bytesWritten;
                         }
@@ -591,13 +596,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void waitForPlaybackToDrain(AudioTrack track, long totalBytes) {
-        long targetFrames = totalBytes / BYTES_PER_SAMPLE;
-        long timeoutAtMs = SystemClock.elapsedRealtime() + 2_000;
-        while (playbackRunning.get()
-                && Integer.toUnsignedLong(track.getPlaybackHeadPosition()) < targetFrames
-                && SystemClock.elapsedRealtime() < timeoutAtMs) {
-            SystemClock.sleep(10);
-        }
+        PcmPlayback.drain(track, totalBytes, BYTES_PER_SAMPLE, playbackRunning::get);
     }
 
     private void stopPlayback(String reason) {

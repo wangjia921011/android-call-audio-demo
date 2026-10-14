@@ -28,6 +28,7 @@ import android.telecom.Call;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -68,7 +69,7 @@ public final class CallCaptureService extends Service {
     private static final String NOTIFICATION_CHANNEL_ID = "call_capture_monitor";
     private static final long CALL_AUDIO_SETTLE_DELAY_MS = 300;
 
-    private static final int SAMPLE_RATE_HZ = 48_000;
+    private static final int SAMPLE_RATE_HZ = PcmFormat.TARGET_SAMPLE_RATE_HZ;
     private static final int CHANNEL_MASK = AudioFormat.CHANNEL_IN_MONO;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
     private static final int BYTES_PER_SAMPLE = 2;
@@ -99,6 +100,9 @@ public final class CallCaptureService extends Service {
 
     private NotificationManager notificationManager;
     private AudioManager audioManager;
+    private CallAudioPlatform platform;
+    private int injectionGeneration;
+    private boolean vendorUplinkMute;
     private CaptureStream downlinkStream;
     private CaptureStream uplinkStream;
     private AudioTrack injectionAudioTrack;
@@ -123,6 +127,7 @@ public final class CallCaptureService extends Service {
         final int audioSource;
         final AudioRecord recorder;
         final File outputFile;
+        final int sampleRate;
         volatile long totalBytes;
         volatile int maximumPeak;
         volatile String terminalError;
@@ -136,12 +141,15 @@ public final class CallCaptureService extends Service {
             this.audioSource = audioSource;
             this.recorder = recorder;
             this.outputFile = outputFile;
+            this.sampleRate = PcmFormat.fromFile(outputFile).sampleRate;
         }
     }
 
     private static final class DownlinkReplacementSession {
         final AtomicBoolean running = new AtomicBoolean(true);
         final File pcmFile;
+        final PcmFormat format;
+        final boolean vendorGains;
         final AudioRecord originalDownlinkRecord;
         final AudioRecord microphoneRecord;
         final AudioTrack callUplinkTrack;
@@ -154,6 +162,8 @@ public final class CallCaptureService extends Service {
                 AudioTrack callUplinkTrack,
                 AudioTrack replacementTrack) {
             this.pcmFile = pcmFile;
+            this.format = PcmFormat.fromFile(pcmFile);
+            this.vendorGains = originalDownlinkRecord == null;
             this.originalDownlinkRecord = originalDownlinkRecord;
             this.microphoneRecord = microphoneRecord;
             this.callUplinkTrack = callUplinkTrack;
@@ -244,6 +254,7 @@ public final class CallCaptureService extends Service {
         instance = this;
         notificationManager = getSystemService(NotificationManager.class);
         audioManager = getSystemService(AudioManager.class);
+        platform = new CallAudioPlatform(audioManager);
         createNotificationChannel();
     }
 
@@ -323,7 +334,8 @@ public final class CallCaptureService extends Service {
         if (state != Call.STATE_ACTIVE && injectionSessionActive) {
             stopUplinkInjection("通话已结束");
         }
-        if (state != Call.STATE_ACTIVE && isDownlinkReplacementActive()) {
+        if (state != Call.STATE_ACTIVE && (isDownlinkReplacementActive()
+                || pendingDownlinkReplacementFile != null)) {
             stopDownlinkReplacement("通话已结束");
         }
 
@@ -374,33 +386,48 @@ public final class CallCaptureService extends Service {
             updateStatus("无法启动双路采集：RECORD_AUDIO 未授予");
             return;
         }
+        if (downlinkStream != null || uplinkStream != null || captureRunningForUi) {
+            updateStatus("上一组采集仍在保存，等待释放后再开始");
+            return;
+        }
+        if (checkSelfPermission("android.permission.CAPTURE_AUDIO_OUTPUT")
+                != PackageManager.PERMISSION_GRANTED) {
+            updateStatus("无法采集通话音频：CAPTURE_AUDIO_OUTPUT 未授予");
+            return;
+        }
+        int sampleRate = platform.captureSampleRate();
+        int channelMask = platform.unisoc ? AudioFormat.CHANNEL_IN_STEREO : CHANNEL_MASK;
         int minBufferSize = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE_HZ, CHANNEL_MASK, ENCODING);
+                sampleRate, channelMask, ENCODING);
         if (minBufferSize <= 0) {
             updateStatus("AudioRecord.getMinBufferSize() 失败：" + minBufferSize);
             return;
         }
         int recorderBufferSize = Math.max(
                 minBufferSize * 2,
-                SAMPLE_RATE_HZ * BYTES_PER_SAMPLE / 5);
+                sampleRate * BYTES_PER_SAMPLE * (platform.unisoc ? 2 : 1) / 5);
 
         String timestamp = new SimpleDateFormat(
                 "yyyyMMdd_HHmmss", Locale.US).format(new Date());
         CaptureStream newDownlink = null;
         CaptureStream newUplink = null;
         try {
-            newDownlink = createCaptureStream(
-                    "下行",
-                    MediaRecorder.AudioSource.VOICE_DOWNLINK,
-                    "downlink_auto_" + timestamp + "_48000_mono_s16le.pcm",
-                    recorderBufferSize);
-            newUplink = createCaptureStream(
-                    "上行",
-                    MediaRecorder.AudioSource.VOICE_UPLINK,
-                    "uplink_auto_" + timestamp + "_48000_mono_s16le.pcm",
-                    recorderBufferSize);
-            startRecorder(newDownlink);
-            startRecorder(newUplink);
+            String suffix = "_" + sampleRate + "_mono_s16le.pcm";
+            if (platform.unisoc) {
+                newDownlink = createCaptureStream("下行", MediaRecorder.AudioSource.VOICE_CALL,
+                        "downlink_auto_" + timestamp + suffix, recorderBufferSize, sampleRate,
+                        AudioFormat.CHANNEL_IN_STEREO);
+                newUplink = new CaptureStream("上行", MediaRecorder.AudioSource.VOICE_CALL,
+                        newDownlink.recorder, createOutputFile("uplink_auto_" + timestamp + suffix));
+                startRecorder(newDownlink);
+            } else {
+                newDownlink = createCaptureStream("下行", MediaRecorder.AudioSource.VOICE_DOWNLINK,
+                        "downlink_auto_" + timestamp + suffix, recorderBufferSize, sampleRate, CHANNEL_MASK);
+                newUplink = createCaptureStream("上行", MediaRecorder.AudioSource.VOICE_UPLINK,
+                        "uplink_auto_" + timestamp + suffix, recorderBufferSize, sampleRate, CHANNEL_MASK);
+                startRecorder(newDownlink);
+                startRecorder(newUplink);
+            }
         } catch (SecurityException exception) {
             releaseFailedStart(newDownlink, newUplink);
             updateStatus("双路自动采集权限被拒绝：" + exception.getMessage());
@@ -423,24 +450,27 @@ public final class CallCaptureService extends Service {
 
         lastDownlinkOutputFile = newDownlink.outputFile;
         lastUplinkOutputFile = newUplink.outputFile;
-        streamsRemaining.set(2);
+        streamsRemaining.set(platform.unisoc ? 1 : 2);
         captureRunning.set(true);
         captureRunningForUi = true;
 
-        Log.i(TAG, "Starting VOICE_DOWNLINK capture: "
+        Log.i(TAG, "Capture backend=" + (platform.unisoc ? "VOICE_CALL stereo TX=L RX=R" : "separate sources")
+                + ", sampleRate=" + sampleRate);
+        Log.i(TAG, "Starting downlink capture: "
                 + newDownlink.outputFile.getAbsolutePath());
-        Log.i(TAG, "Starting VOICE_UPLINK capture: "
+        Log.i(TAG, "Starting uplink capture: "
                 + newUplink.outputFile.getAbsolutePath());
         updateStatus("电话已接通，正在分别采集下行和上行 PCM");
 
         CaptureStream finalDownlink = newDownlink;
         CaptureStream finalUplink = newUplink;
-        new Thread(
-                () -> captureLoop(finalDownlink),
-                "AutomaticVoiceDownlinkCapture").start();
-        new Thread(
-                () -> captureLoop(finalUplink),
-                "AutomaticVoiceUplinkCapture").start();
+        if (platform.unisoc) {
+            new Thread(() -> stereoCaptureLoop(finalDownlink, finalUplink),
+                    "AutomaticVoiceCallStereoCapture").start();
+        } else {
+            new Thread(() -> captureLoop(finalDownlink), "AutomaticVoiceDownlinkCapture").start();
+            new Thread(() -> captureLoop(finalUplink), "AutomaticVoiceUplinkCapture").start();
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -448,12 +478,12 @@ public final class CallCaptureService extends Service {
             String directionName,
             int audioSource,
             String fileName,
-            int recorderBufferSize) throws IOException {
+            int recorderBufferSize, int sampleRate, int channelMask) throws IOException {
         AudioRecord recorder = new AudioRecord.Builder()
                 .setAudioSource(audioSource)
                 .setAudioFormat(new AudioFormat.Builder()
-                        .setSampleRate(SAMPLE_RATE_HZ)
-                        .setChannelMask(CHANNEL_MASK)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelMask)
                         .setEncoding(ENCODING)
                         .build())
                 .setBufferSizeInBytes(recorderBufferSize)
@@ -539,6 +569,42 @@ public final class CallCaptureService extends Service {
         }
     }
 
+    private void stereoCaptureLoop(CaptureStream downlink, CaptureStream uplink) {
+        // Read size must be a multiple of one TX/RX frame (4 bytes).
+        byte[] stereo = new byte[3200];
+        byte[] tx = new byte[1600];
+        byte[] rx = new byte[1600];
+        long lastUpdate = 0;
+        try (BufferedOutputStream txOut = new BufferedOutputStream(new FileOutputStream(uplink.outputFile));
+             BufferedOutputStream rxOut = new BufferedOutputStream(new FileOutputStream(downlink.outputFile))) {
+            while (captureRunning.get()) {
+                int read = downlink.recorder.read(stereo, 0, stereo.length, AudioRecord.READ_BLOCKING);
+                if (read < 0) {
+                    if (captureRunning.get()) throw new IOException("VOICE_CALL.read(): " + readErrorName(read));
+                    break;
+                }
+                if (read == 0) continue;
+                int monoBytes = PcmIo.splitTxRx(stereo, read, tx, rx);
+                txOut.write(tx, 0, monoBytes); rxOut.write(rx, 0, monoBytes);
+                uplink.totalBytes += monoBytes; downlink.totalBytes += monoBytes;
+                uplink.maximumPeak = Math.max(uplink.maximumPeak, calculatePcm16Peak(tx, monoBytes));
+                downlink.maximumPeak = Math.max(downlink.maximumPeak, calculatePcm16Peak(rx, monoBytes));
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastUpdate >= 500) {
+                    lastUpdate = now;
+                    mainHandler.post(this::updateDualCaptureStatus);
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            downlink.terminalError = uplink.terminalError = "双声道采集失败：" + e.getMessage();
+        } finally {
+            releaseStreamRecorder(downlink); // Shared recorder must be released exactly once.
+            captureRunning.set(false);
+            streamsRemaining.decrementAndGet();
+            mainHandler.post(this::finishCaptureSession);
+        }
+    }
+
     private void updateDualCaptureStatus() {
         if (!captureRunning.get()) {
             return;
@@ -551,9 +617,9 @@ public final class CallCaptureService extends Service {
         updateStatus(String.format(
                 Locale.US,
                 "双路采集中\n下行：%.1f 秒，峰值 %d\n上行：%.1f 秒，峰值 %d",
-                pcmSeconds(downlink.totalBytes),
+                new PcmFormat(downlink.sampleRate).seconds(downlink.totalBytes),
                 downlink.maximumPeak,
-                pcmSeconds(uplink.totalBytes),
+                new PcmFormat(uplink.sampleRate).seconds(uplink.totalBytes),
                 uplink.maximumPeak));
     }
 
@@ -575,11 +641,11 @@ public final class CallCaptureService extends Service {
                 Locale.US,
                 "%s\n下行：%.1f 秒，%d 字节，峰值 %d%s\n上行：%.1f 秒，%d 字节，峰值 %d%s\n文件：%s / %s",
                 hasError ? "上次双路采集结束（存在错误）" : "上次双路采集成功",
-                pcmSeconds(downlink.totalBytes),
+                new PcmFormat(downlink.sampleRate).seconds(downlink.totalBytes),
                 downlink.totalBytes,
                 downlink.maximumPeak,
                 errorSuffix(downlink.terminalError),
-                pcmSeconds(uplink.totalBytes),
+                new PcmFormat(uplink.sampleRate).seconds(uplink.totalBytes),
                 uplink.totalBytes,
                 uplink.maximumPeak,
                 errorSuffix(uplink.terminalError),
@@ -593,7 +659,13 @@ public final class CallCaptureService extends Service {
         }
 
         if (!destroying) {
-            if (isDownlinkReplacementActive() || pendingDownlinkReplacementFile != null) {
+            if (pendingDownlinkReplacementFile != null) {
+                File pending = pendingDownlinkReplacementFile;
+                pendingDownlinkReplacementFile = null;
+                mainHandler.post(() -> startDownlinkReplacement(pending));
+                return;
+            }
+            if (isDownlinkReplacementActive()) {
                 updateStatus("下行替换进行中，普通双路采集已暂停");
             } else {
                 updateIdleStatus();
@@ -610,10 +682,6 @@ public final class CallCaptureService extends Service {
         return error == null ? "" : "，错误：" + error;
     }
 
-    private static double pcmSeconds(long totalBytes) {
-        return totalBytes / (double) (SAMPLE_RATE_HZ * BYTES_PER_SAMPLE);
-    }
-
     private void stopCapture(String reason) {
         if (!captureRunning.getAndSet(false)) {
             return;
@@ -623,7 +691,8 @@ public final class CallCaptureService extends Service {
 
         synchronized (recorderLock) {
             requestRecorderStop(downlinkStream);
-            requestRecorderStop(uplinkStream);
+            if (uplinkStream != null && (downlinkStream == null
+                    || uplinkStream.recorder != downlinkStream.recorder)) requestRecorderStop(uplinkStream);
         }
     }
 
@@ -652,7 +721,9 @@ public final class CallCaptureService extends Service {
             @Nullable CaptureStream uplink) {
         synchronized (recorderLock) {
             releaseFailedStream(downlink);
-            releaseFailedStream(uplink);
+            if (uplink != null && (downlink == null || uplink.recorder != downlink.recorder)) {
+                releaseFailedStream(uplink);
+            }
         }
     }
 
@@ -688,6 +759,11 @@ public final class CallCaptureService extends Service {
             return;
         }
 
+        if (injectionAudioTrack != null) {
+            updateInjectionStatus("上一条上行注入流尚未释放");
+            return;
+        }
+        PcmFormat format = PcmFormat.fromFile(pcmFile);
         AudioDeviceInfo telephonyTxDevice = findTelephonyTxDevice();
         if (telephonyTxDevice == null) {
             updateInjectionStatus("无法开始上行注入：设备未声明 Telephony Tx 输出");
@@ -695,7 +771,7 @@ public final class CallCaptureService extends Service {
         }
 
         int minBufferSize = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE_HZ, INJECTION_CHANNEL_MASK, ENCODING);
+                format.sampleRate, INJECTION_CHANNEL_MASK, ENCODING);
         if (minBufferSize <= 0) {
             updateInjectionStatus("无法开始上行注入：AudioTrack 最小缓冲区错误 "
                     + minBufferSize);
@@ -710,13 +786,13 @@ public final class CallCaptureService extends Service {
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build())
                     .setAudioFormat(new AudioFormat.Builder()
-                            .setSampleRate(SAMPLE_RATE_HZ)
+                            .setSampleRate(format.sampleRate)
                             .setChannelMask(INJECTION_CHANNEL_MASK)
                             .setEncoding(ENCODING)
                             .build())
                     .setBufferSizeInBytes(Math.max(
                             minBufferSize * 2,
-                            SAMPLE_RATE_HZ * INJECTION_FRAME_BYTES / 5))
+                            format.sampleRate * INJECTION_FRAME_BYTES / 5))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
         } catch (RuntimeException exception) {
@@ -737,12 +813,19 @@ public final class CallCaptureService extends Service {
         }
 
         int currentMuteState = CallStateInCallService.getCurrentMuteState();
-        if (currentMuteState < 0 || !CallStateInCallService.requestMuted(true)) {
+        muteStateBeforeInjection = currentMuteState == 1;
+        vendorUplinkMute = platform.supportsVoiceGains;
+        try {
+            if (vendorUplinkMute) platform.muteOriginal(true, false);
+            else if (currentMuteState < 0 || !CallStateInCallService.requestMuted(true)) {
+                throw new IllegalStateException("无法静音真实麦克风");
+            }
+        } catch (RuntimeException e) {
             track.release();
-            updateInjectionStatus("无法静音真实麦克风，已取消上行注入");
+            restoreMuteStateAfterInjection();
+            updateInjectionStatus("已取消上行注入：" + e.getMessage());
             return;
         }
-        muteStateBeforeInjection = currentMuteState == 1;
 
         synchronized (injectionLock) {
             if (injectionSessionActive || injectionAudioTrack != null) {
@@ -769,7 +852,7 @@ public final class CallCaptureService extends Service {
         }
 
         injectionPlaybackRunning.set(true);
-        double seconds = pcmSeconds(pcmFile.length());
+        double seconds = format.seconds(pcmFile.length());
         updateInjectionStatus(String.format(
                 Locale.US,
                 "正在向通话上行注入：%s（%.1f 秒）\n真实麦克风已静音",
@@ -779,24 +862,14 @@ public final class CallCaptureService extends Service {
                 + pcmFile.getAbsolutePath()
                 + ", preferredDeviceId=" + telephonyTxDevice.getId());
 
+        int generation = ++injectionGeneration;
         new Thread(
-                () -> uplinkInjectionLoop(track, pcmFile),
+                () -> uplinkInjectionLoop(track, pcmFile, generation),
                 "TelephonyTxPcmInjection").start();
     }
 
     private boolean isValidInjectionPcm(File pcmFile) {
-        if (!pcmFile.isFile()
-                || pcmFile.length() <= 0
-                || (pcmFile.length() & 1) != 0
-                || !pcmFile.getName().toLowerCase(Locale.ROOT).endsWith(".pcm")) {
-            return false;
-        }
-        try {
-            return pcmFile.getCanonicalFile().getParentFile()
-                    .equals(createOutputFile("probe").getCanonicalFile().getParentFile());
-        } catch (IOException exception) {
-            return false;
-        }
+        return PcmFileStore.isUsablePcm(this, pcmFile);
     }
 
     @Nullable
@@ -812,7 +885,7 @@ public final class CallCaptureService extends Service {
         return null;
     }
 
-    private void uplinkInjectionLoop(AudioTrack track, File pcmFile) {
+    private void uplinkInjectionLoop(AudioTrack track, File pcmFile, int generation) {
         byte[] monoBuffer = new byte[READ_CHUNK_BYTES];
         byte[] stereoBuffer = new byte[READ_CHUNK_BYTES * 2];
         long injectedMonoBytes = 0;
@@ -823,7 +896,7 @@ public final class CallCaptureService extends Service {
         try (BufferedInputStream input = new BufferedInputStream(
                 new FileInputStream(pcmFile), READ_CHUNK_BYTES * 4)) {
             while (injectionPlaybackRunning.get()) {
-                int bytesRead = input.read(monoBuffer);
+                int bytesRead = PcmIo.readFrames(input, monoBuffer, BYTES_PER_SAMPLE);
                 if (bytesRead < 0) {
                     reachedEnd = true;
                     break;
@@ -837,18 +910,18 @@ public final class CallCaptureService extends Service {
                             offset,
                             stereoBytes - offset,
                             AudioTrack.WRITE_BLOCKING);
-                    if (bytesWritten < 0) {
+                    if (bytesWritten <= 0) {
                         terminalError = "Telephony Tx AudioTrack.write() 失败：" + bytesWritten;
                         break;
                     }
                     offset += bytesWritten;
                 }
-                injectedMonoBytes += monoBytes;
+                injectedMonoBytes += offset / 2;
                 if (terminalError != null) {
                     break;
                 }
 
-                if (!routeVerified && injectedMonoBytes >= SAMPLE_RATE_HZ / 5L * BYTES_PER_SAMPLE) {
+                if (!routeVerified && injectedMonoBytes > 0) {
                     AudioDeviceInfo routedDevice = track.getRoutedDevice();
                     if (routedDevice == null
                             || routedDevice.getType() != AudioDeviceInfo.TYPE_TELEPHONY) {
@@ -860,6 +933,10 @@ public final class CallCaptureService extends Service {
                             + routedDevice.getId());
                 }
             }
+            if (reachedEnd && terminalError == null) {
+                PcmPlayback.drain(track, injectedMonoBytes * 2, INJECTION_FRAME_BYTES,
+                        injectionPlaybackRunning::get);
+            }
         } catch (IOException exception) {
             terminalError = "读取注入 PCM 失败：" + exception.getMessage();
         } catch (RuntimeException exception) {
@@ -870,8 +947,10 @@ public final class CallCaptureService extends Service {
             String finalError = terminalError;
             boolean finalReachedEnd = reachedEnd;
             long finalInjectedBytes = injectedMonoBytes;
-            mainHandler.post(() -> onInjectionPlaybackFinished(
-                    finalReachedEnd, finalInjectedBytes, finalError));
+            mainHandler.post(() -> {
+                if (generation == injectionGeneration) onInjectionPlaybackFinished(
+                        finalReachedEnd, finalInjectedBytes, PcmFormat.fromFile(pcmFile), finalError);
+            });
         }
     }
 
@@ -891,6 +970,7 @@ public final class CallCaptureService extends Service {
     private void onInjectionPlaybackFinished(
             boolean reachedEnd,
             long injectedMonoBytes,
+            PcmFormat format,
             @Nullable String error) {
         if (!injectionSessionActive) {
             return;
@@ -900,10 +980,8 @@ public final class CallCaptureService extends Service {
             finishUplinkInjection("上行注入失败：" + error);
         } else if (reachedEnd) {
             Log.i(TAG, "Telephony Tx PCM injection completed: bytes=" + injectedMonoBytes);
-            updateInjectionStatus(String.format(
-                    Locale.US,
-                    "PCM 注入完成：%.1f 秒\n真实麦克风仍保持静音；点击停止注入后恢复",
-                    pcmSeconds(injectedMonoBytes)));
+            finishUplinkInjection(String.format(Locale.US,
+                    "PCM 注入完成：%.1f 秒", format.seconds(injectedMonoBytes)));
         } else {
             finishUplinkInjection("上行注入已停止");
         }
@@ -913,6 +991,7 @@ public final class CallCaptureService extends Service {
         if (!injectionSessionActive) {
             return;
         }
+        ++injectionGeneration; // Invalidate completion callbacks from the cancelled session.
         Log.i(TAG, "Stopping Telephony Tx injection: " + reason);
         injectionPlaybackRunning.set(false);
 
@@ -957,7 +1036,12 @@ public final class CallCaptureService extends Service {
     }
 
     private void restoreMuteStateAfterInjection() {
-        CallStateInCallService.requestMuted(muteStateBeforeInjection);
+        if (vendorUplinkMute) {
+            try { platform.restoreOriginal(); }
+            catch (RuntimeException e) { Log.e(TAG, "恢复上行原声失败", e); }
+        } else {
+            CallStateInCallService.requestMuted(muteStateBeforeInjection);
+        }
     }
 
     private void releaseInjectionAudioTrack(AudioTrack track) {
@@ -987,7 +1071,8 @@ public final class CallCaptureService extends Service {
     }
 
     private void startDownlinkReplacement(File pcmFile) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        if (!platform.supportsVoiceGains
+                && Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             updateDownlinkReplacementStatus("下行替换需要 Android 14 或更高版本");
             return;
         }
@@ -1026,20 +1111,18 @@ public final class CallCaptureService extends Service {
             return;
         }
 
-        if (captureRunning.get()) {
+        if (captureRunning.get() || captureRunningForUi) {
             pendingDownlinkReplacementFile = pcmFile;
             updateDownlinkReplacementStatus("正在停止普通双路采集并切换到 Call Redirect……");
             stopCapture("准备启动下行替换");
-            mainHandler.postDelayed(() -> {
-                if (pendingDownlinkReplacementFile != null
-                        && pendingDownlinkReplacementFile.equals(pcmFile)) {
-                    pendingDownlinkReplacementFile = null;
-                    startDownlinkReplacement(pcmFile);
-                }
-            }, CALL_AUDIO_SETTLE_DELAY_MS);
             return;
         }
         pendingDownlinkReplacementFile = null;
+        if (platform.supportsVoiceGains) {
+            startVendorDownlinkReplacement(pcmFile);
+            return;
+        }
+        PcmFormat pcmFormat = PcmFormat.fromFile(pcmFile);
 
         AudioRecord originalDownlinkRecord = null;
         AudioRecord microphoneRecord = null;
@@ -1055,20 +1138,20 @@ public final class CallCaptureService extends Service {
 
             AudioDeviceInfo communicationDevice = audioManager.getCommunicationDevice();
             AudioFormat downlinkFormat = new AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE_HZ)
+                    .setSampleRate(pcmFormat.sampleRate)
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                     .setEncoding(ENCODING)
                     .build();
             AudioFormat uplinkFormat = new AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE_HZ)
+                    .setSampleRate(pcmFormat.sampleRate)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .setEncoding(ENCODING)
                     .build();
 
             int microphoneMinBuffer = AudioRecord.getMinBufferSize(
-                    SAMPLE_RATE_HZ, AudioFormat.CHANNEL_IN_MONO, ENCODING);
+                    pcmFormat.sampleRate, AudioFormat.CHANNEL_IN_MONO, ENCODING);
             int replacementMinBuffer = AudioTrack.getMinBufferSize(
-                    SAMPLE_RATE_HZ, AudioFormat.CHANNEL_OUT_MONO, ENCODING);
+                    pcmFormat.sampleRate, AudioFormat.CHANNEL_OUT_MONO, ENCODING);
             if (microphoneMinBuffer <= 0 || replacementMinBuffer <= 0) {
                 throw new IllegalStateException(
                         "本地音频缓冲区不可用：record=" + microphoneMinBuffer
@@ -1141,7 +1224,7 @@ public final class CallCaptureService extends Service {
                     "已进入 MODE_CALL_REDIRECT\n正在播放：%s（%.1f 秒）\n"
                             + "真实下行已阻断；本机麦克风继续桥接到上行",
                     pcmFile.getName(),
-                    pcmSeconds(pcmFile.length())));
+                    pcmFormat.seconds(pcmFile.length())));
             Log.i(TAG, "Official PSTN downlink replacement started: file="
                     + pcmFile.getAbsolutePath()
                     + ", communicationDevice="
@@ -1184,6 +1267,73 @@ public final class CallCaptureService extends Service {
                 mainHandler.postDelayed(delayedCaptureStart, CALL_AUDIO_SETTLE_DELAY_MS);
             }
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private void startVendorDownlinkReplacement(File pcmFile) {
+        AudioTrack track = null;
+        try {
+            PcmFormat format = PcmFormat.fromFile(pcmFile);
+            int min = AudioTrack.getMinBufferSize(format.sampleRate,
+                    AudioFormat.CHANNEL_OUT_MONO, ENCODING);
+            if (min <= 0) throw new IllegalStateException("下行播放缓冲区不可用");
+            AudioDeviceInfo device = audioManager.getCommunicationDevice();
+            if (device == null) throw new IllegalStateException("没有可用的通话输出设备");
+            track = new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setLegacyStreamType(AudioManager.STREAM_VOICE_CALL)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                    .setAudioFormat(new AudioFormat.Builder().setSampleRate(format.sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(ENCODING).build())
+                    .setBufferSizeInBytes(Math.max(min * 2, READ_CHUNK_BYTES * 4))
+                    .setTransferMode(AudioTrack.MODE_STREAM).build();
+            requireInitialized(track, "厂商下行替换 AudioTrack");
+            if (!track.setPreferredDevice(device)) throw new IllegalStateException("通话输出路由被拒绝");
+            platform.muteOriginal(false, true);
+            track.play();
+            Log.i(TAG, "Vendor downlink replacement route: "
+                    + describeAudioDevice(track.getRoutedDevice()));
+            DownlinkReplacementSession session = new DownlinkReplacementSession(pcmFile,
+                    null, null, null, track);
+            synchronized (downlinkReplacementLock) {
+                downlinkReplacementSession = session;
+                downlinkReplacementActiveForUi = true;
+            }
+            updateDownlinkReplacementStatus("厂商下行替换已启动，麦克风保持原通话路由");
+            new Thread(() -> playDownlinkReplacementPcm(session), "VendorDownlinkPlayback").start();
+        } catch (RuntimeException e) {
+            stopAndReleaseAudioTrack(track);
+            try { platform.restoreOriginal(); } catch (RuntimeException restoreError) {
+                Log.e(TAG, "恢复下行原声失败", restoreError);
+            }
+            updateDownlinkReplacementStatus("下行替换失败：" + rootCauseMessage(e));
+            mainHandler.postDelayed(delayedCaptureStart, CALL_AUDIO_SETTLE_DELAY_MS);
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    public static void onTelecomAudioRouteChanged() {
+        CallCaptureService service = instance;
+        if (service == null) return;
+        service.mainHandler.post(() -> {
+            try {
+                if (service.vendorUplinkMute && service.injectionSessionActive) {
+                    service.platform.muteOriginal(true, false);
+                }
+                DownlinkReplacementSession session = service.downlinkReplacementSession;
+                if (session != null && session.running.get()) {
+                    if (session.vendorGains) service.platform.muteOriginal(false, true);
+                    AudioTrack track = session.replacementTrack;
+                    AudioDeviceInfo device = service.audioManager.getCommunicationDevice();
+                    if (track != null && device != null && !track.setPreferredDevice(device)) {
+                        throw new IllegalStateException("下行替换无法切换通话路由");
+                    }
+                }
+            } catch (RuntimeException e) {
+                service.stopUplinkInjection("路由切换失败");
+                service.stopDownlinkReplacement("路由切换失败：" + e.getMessage());
+            }
+        });
     }
 
     private boolean isPstnCallAudioInterceptable() throws ReflectiveOperationException {
@@ -1285,7 +1435,7 @@ public final class CallCaptureService extends Service {
                             offset,
                             bytesRead - offset,
                             AudioTrack.WRITE_BLOCKING);
-                    if (bytesWritten < 0) {
+                    if (bytesWritten <= 0) {
                         error = "通话上行桥接写入失败：" + bytesWritten;
                         break;
                     }
@@ -1310,23 +1460,26 @@ public final class CallCaptureService extends Service {
         long totalBytes = 0;
         int maximumPeak = 0;
         boolean routeReported = false;
+        boolean reachedEnd = false;
+        AudioTrack playbackTrack = session.replacementTrack;
         String error = null;
         try (BufferedInputStream input = new BufferedInputStream(
                 new FileInputStream(session.pcmFile), READ_CHUNK_BYTES * 4)) {
             while (session.running.get()) {
-                int bytesRead = input.read(buffer);
+                int bytesRead = PcmIo.readFrames(input, buffer, BYTES_PER_SAMPLE);
                 if (bytesRead < 0) {
+                    reachedEnd = true;
                     break;
                 }
                 maximumPeak = Math.max(maximumPeak, calculatePcm16Peak(buffer, bytesRead));
                 int offset = 0;
                 while (offset < bytesRead && session.running.get()) {
-                    int bytesWritten = session.replacementTrack.write(
+                    int bytesWritten = playbackTrack.write(
                             buffer,
                             offset,
                             bytesRead - offset,
                             AudioTrack.WRITE_BLOCKING);
-                    if (bytesWritten < 0) {
+                    if (bytesWritten <= 0) {
                         error = "替换 PCM 写入失败：" + bytesWritten;
                         break;
                     }
@@ -1337,9 +1490,9 @@ public final class CallCaptureService extends Service {
                     break;
                 }
                 if (!routeReported
-                        && totalBytes >= SAMPLE_RATE_HZ / 5L * BYTES_PER_SAMPLE) {
+                        && totalBytes >= session.format.sampleRate / 5L * BYTES_PER_SAMPLE) {
                     routeReported = true;
-                    AudioDeviceInfo routedDevice = session.replacementTrack.getRoutedDevice();
+                    AudioDeviceInfo routedDevice = playbackTrack.getRoutedDevice();
                     String routeDescription = describeAudioDevice(routedDevice);
                     long reportedBytes = totalBytes;
                     int reportedPeak = maximumPeak;
@@ -1350,6 +1503,9 @@ public final class CallCaptureService extends Service {
                     mainHandler.post(() -> reportDownlinkReplacementRoute(
                             session, routeDescription, reportedBytes, reportedPeak));
                 }
+            }
+            if (reachedEnd && error == null) {
+                PcmPlayback.drain(playbackTrack, totalBytes, BYTES_PER_SAMPLE, session.running::get);
             }
         } catch (IOException | RuntimeException exception) {
             error = "替换 PCM 播放异常：" + rootCauseMessage(exception);
@@ -1378,11 +1534,8 @@ public final class CallCaptureService extends Service {
                         return;
                     }
                 }
-                updateDownlinkReplacementStatus(String.format(
-                        Locale.US,
-                        "替换 PCM 已播放完成：%.1f 秒\n"
-                                + "真实下行仍保持阻断；点击停止后恢复对方声音",
-                        pcmSeconds(finalTotalBytes)));
+                stopDownlinkReplacement(String.format(Locale.US,
+                        "替换 PCM 播放完成：%.1f 秒", session.format.seconds(finalTotalBytes)));
             });
         }
     }
@@ -1397,16 +1550,23 @@ public final class CallCaptureService extends Service {
                 return;
             }
         }
+        String modeText = session.vendorGains
+                ? "展锐 voice_dl_gain 原声静音链路"
+                : "MODE_CALL_REDIRECT 下行替换链路";
+        String bridgeText = session.vendorGains
+                ? "真实下行已静音；PCM 正在通话输出路由播放"
+                : "真实下行已阻断；本机麦克风继续桥接到上行";
         updateDownlinkReplacementStatus(String.format(
                 Locale.US,
-                "已进入 MODE_CALL_REDIRECT\n正在播放：%s（%.1f 秒）\n"
-                        + "实际播放路由：%s\n已写入 %d 字节，PCM 峰值 %d\n"
-                        + "真实下行已阻断；本机麦克风继续桥接到上行",
+                "%s\n正在播放：%s（%.1f 秒）\n"
+                        + "实际播放路由：%s\n已写入 %d 字节，PCM 峰值 %d\n%s",
+                modeText,
                 session.pcmFile.getName(),
-                pcmSeconds(session.pcmFile.length()),
+                session.format.seconds(session.pcmFile.length()),
                 routeDescription,
                 bytesWritten,
-                pcmPeak));
+                pcmPeak,
+                bridgeText));
     }
 
     private static String describeAudioDevice(@Nullable AudioDeviceInfo device) {
@@ -1480,7 +1640,14 @@ public final class CallCaptureService extends Service {
         stopAndReleaseAudioTrack(session.callUplinkTrack);
         stopAndReleaseAudioRecord(session.microphoneRecord);
         stopAndReleaseAudioRecord(session.originalDownlinkRecord);
-        restoreAudioModeAfterCallRedirect();
+        if (session.vendorGains) {
+            try { platform.restoreOriginal(); } catch (RuntimeException e) {
+                updateDownlinkReplacementStatus("恢复原声失败：" + e.getMessage());
+                return;
+            }
+        } else {
+            restoreAudioModeAfterCallRedirect();
+        }
         updateDownlinkReplacementStatus(reason + "；原始通话上下行路由已恢复");
 
         if (!destroying

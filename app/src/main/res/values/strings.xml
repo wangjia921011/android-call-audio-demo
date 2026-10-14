@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">通话 PCM 采集与注入</string>
     <string name="title_downlink_capture">通话 PCM 分路采集与双向注入</string>
-    <string name="format_description">格式：48 kHz · 单声道 · PCM16 little-endian · 原始 .pcm 文件</string>
+    <string name="format_description">格式：所有设备统一 16 kHz · 单声道 · PCM16 小端 · 原始 .pcm 文件</string>
 
     <string name="permission_checking">正在检查权限……</string>
     <string name="permission_state">RECORD_AUDIO：%1$s\nCAPTURE_AUDIO_OUTPUT：%2$s\nCONTROL_INCALL_EXPERIENCE：%3$s\nMODIFY_PHONE_STATE：%4$s\nCALL_AUDIO_INTERCEPTION：%5$s</string>
@@ -15,7 +15,7 @@
     <string name="auto_status_stopping">正在停止自动监听服务……</string>
     <string name="auto_status_missing_platform_permissions">无法启动：缺少 CAPTURE_AUDIO_OUTPUT 或 CONTROL_INCALL_EXPERIENCE 平台权限。</string>
 
-    <string name="uplink_injection_title">Telephony Tx 上行注入</string>
+    <string name="uplink_injection_title">通话上行注入</string>
     <string name="select_uplink_pcm">选择上行 PCM</string>
     <string name="start_uplink_injection">开始上行注入</string>
     <string name="stop_uplink_injection">停止上行注入并恢复原声</string>
@@ -26,12 +26,12 @@
     <string name="uplink_pcm_not_selected">上行预选：尚未选择 PCM</string>
     <string name="uplink_pcm_selected_file">上行预选：%1$s</string>
     <string name="uplink_pcm_not_selected_error">请先从 PCM 列表选择上行注入文件。</string>
-    <string name="downlink_replacement_title">Call Redirect 下行替换</string>
+    <string name="downlink_replacement_title">通话下行替换</string>
     <string name="select_downlink_pcm">选择下行 PCM</string>
     <string name="start_downlink_replacement">开始下行注入</string>
     <string name="stop_downlink_replacement">停止下行注入并恢复原声</string>
     <string name="downlink_replacement_idle">下行注入未启动。可提前选择 PCM；通话接通后点击开始，本机将听到所选 PCM。</string>
-    <string name="downlink_replacement_starting">正在进入 MODE_CALL_REDIRECT 并替换真实下行……</string>
+    <string name="downlink_replacement_starting">正在检查设备能力并替换真实下行……</string>
     <string name="downlink_replacement_stopping">正在停止下行替换并恢复原始通话路由……</string>
     <string name="downlink_replacement_requires_active_call">电话尚未接通，不能开始下行注入。</string>
     <string name="downlink_pcm_not_selected">下行预选：尚未选择 PCM</string>
@@ -45,7 +45,7 @@
     <string name="pcm_config_idle">这里显示 call_pcm 目录中的全部 PCM。点击文件完成预选，然后返回主页开始注入。</string>
     <string name="refresh_pcm_list">刷新 PCM 列表</string>
     <string name="no_pcm_files">call_pcm 目录里还没有 PCM 文件。</string>
-    <string name="invalid_pcm_selection">该文件不是可用的 48 kHz 单声道 PCM16 文件。</string>
+    <string name="invalid_pcm_selection">请使用非空的 16 kHz 单声道 PCM16 小端文件，字节数须为偶数，文件名以 _16000_mono_s16le.pcm 结尾；其他格式请先转换。</string>
     <string name="uplink_pcm_selected">已预选为上行注入 PCM；返回主页后点击“开始上行注入”。</string>
     <string name="downlink_pcm_selected">已预选为下行注入 PCM；返回主页后点击“开始下行注入”。</string>
     <string name="delete_pcm">删除</string>

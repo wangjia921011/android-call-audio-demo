@@ -43,7 +43,7 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
 
     private static final String EXTRA_TARGET = "target";
 
-    private static final int SAMPLE_RATE_HZ = 48_000;
+    private static final int SAMPLE_RATE_HZ = PcmFormat.TARGET_SAMPLE_RATE_HZ;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
     private static final int BYTES_PER_SAMPLE = 2;
     private static final int READ_CHUNK_BYTES = SAMPLE_RATE_HZ * BYTES_PER_SAMPLE / 20;
@@ -222,16 +222,21 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
         } else {
             direction = "PCM";
         }
-        double seconds = file.length() / (double) (SAMPLE_RATE_HZ * BYTES_PER_SAMPLE);
+        PcmFormat format;
+        try { format = PcmFormat.fromFile(file); }
+        catch (IllegalArgumentException e) { return direction + " · " + file.length()
+                + " 字节\n仅支持 _16000_mono_s16le.pcm"; }
+        double seconds = format.seconds(file.length());
         String modified = DateFormat.getDateTimeInstance(
                 DateFormat.SHORT, DateFormat.MEDIUM).format(new Date(file.lastModified()));
         String validity = isUsablePcm(file) ? "" : "\n不可注入：文件为空或 PCM16 字节未对齐";
         return String.format(
                 Locale.US,
-                "%s · %.1f 秒 · %,d 字节\n%s%s",
+                "%s · %.1f 秒 · %,d 字节 · %d Hz 单声道\n%s%s",
                 direction,
                 seconds,
                 file.length(),
+                format.sampleRate,
                 modified,
                 validity);
     }
@@ -295,6 +300,9 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
     }
 
     private void updateOperationState() {
+        if (previewRunning.get() && hasAnyCallInProgress()) {
+            stopPreview("检测到电话，停止试听");
+        }
         boolean uplinkActive = CallCaptureService.isUplinkInjectionActive();
         boolean downlinkActive = CallCaptureService.isDownlinkReplacementActive();
         boolean targetActive = isUplink() ? uplinkActive : downlinkActive;
@@ -314,9 +322,19 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
             operationStatusText.setText(R.string.preview_blocked_by_call);
             return;
         }
-        stopPreview("切换试听文件");
+        if (!PcmFileStore.isUsablePcm(this, file)) {
+            operationStatusText.setText(R.string.invalid_pcm_selection);
+            return;
+        }
+        synchronized (previewLock) {
+            if (previewTrack != null) {
+                operationStatusText.setText(R.string.status_previous_playback_not_released);
+                return;
+            }
+        }
+        PcmFormat format = PcmFormat.fromFile(file);
         int minBufferSize = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE_HZ, AudioFormat.CHANNEL_OUT_MONO, ENCODING);
+                format.sampleRate, AudioFormat.CHANNEL_OUT_MONO, ENCODING);
         if (minBufferSize <= 0) {
             operationStatusText.setText(getString(
                     R.string.status_playback_buffer_failed, minBufferSize));
@@ -331,7 +349,7 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build())
                     .setAudioFormat(new AudioFormat.Builder()
-                            .setSampleRate(SAMPLE_RATE_HZ)
+                            .setSampleRate(format.sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .setEncoding(ENCODING)
                             .build())
@@ -353,7 +371,16 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
             previewFile = file;
             previewRunning.set(true);
         }
-        track.play();
+        try {
+            track.play();
+        } catch (RuntimeException e) {
+            track.release();
+            synchronized (previewLock) {
+                previewTrack = null; previewFile = null; previewRunning.set(false);
+            }
+            operationStatusText.setText(getString(R.string.preview_failed, e.getMessage()));
+            return;
+        }
         operationStatusText.setText(getString(R.string.previewing_pcm, file.getName()));
         refreshPcmList();
         new Thread(() -> previewLoop(track, file), "PcmInjectionPreview").start();
@@ -362,27 +389,32 @@ public final class PcmInjectionConfigActivity extends AppCompatActivity {
     private void previewLoop(AudioTrack track, File file) {
         byte[] buffer = new byte[READ_CHUNK_BYTES];
         String error = null;
+        long totalBytes = 0;
+        boolean reachedEnd = false;
         try (BufferedInputStream input = new BufferedInputStream(
                 new FileInputStream(file), READ_CHUNK_BYTES * 4)) {
             while (previewRunning.get()) {
-                int bytesRead = input.read(buffer);
+                int bytesRead = PcmIo.readFrames(input, buffer, BYTES_PER_SAMPLE);
                 if (bytesRead < 0) {
+                    reachedEnd = true;
                     break;
                 }
                 int offset = 0;
                 while (offset < bytesRead && previewRunning.get()) {
                     int written = track.write(
                             buffer, offset, bytesRead - offset, AudioTrack.WRITE_BLOCKING);
-                    if (written < 0) {
+                    if (written <= 0) {
                         error = "AudioTrack.write()=" + written;
                         break;
                     }
                     offset += written;
+                    totalBytes += written;
                 }
                 if (error != null) {
                     break;
                 }
             }
+            if (reachedEnd) PcmPlayback.drain(track, totalBytes, BYTES_PER_SAMPLE, previewRunning::get);
         } catch (IOException | RuntimeException exception) {
             error = exception.getClass().getSimpleName() + "：" + exception.getMessage();
         } finally {

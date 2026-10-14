@@ -1,15 +1,23 @@
+# IDE metadata and local machine settings
+.idea/
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
 local.properties
+.DS_Store
+
+# Gradle caches and generated build output (keep gradle/ and the wrapper tracked)
+.gradle/
+.kotlin/
+build/
+.externalNativeBuild/
+.cxx/
+captures/
+
+# Generated packages, diagnostics, and editor temporary files
+*.apk
+*.aab
+*.ap_
+*.hprof
+*.log
+*~
+*.swp
+*.swo

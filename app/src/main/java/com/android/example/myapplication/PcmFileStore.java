@@ -54,10 +54,11 @@ final class PcmFileStore {
             return false;
         }
         try {
+            PcmFormat.fromFile(file);
             File parent = file.getCanonicalFile().getParentFile();
             return parent != null
                     && parent.equals(getPcmDirectory(context).getCanonicalFile());
-        } catch (IOException exception) {
+        } catch (IOException | IllegalArgumentException exception) {
             return false;
         }
     }
